@@ -1,0 +1,809 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  AffiliationOverview,
+  AffiliationPreview,
+  applyAffiliations,
+  cancelOnlineEnrichment,
+  EnrichmentJob,
+  getAffiliationOverview,
+  getLatestOnlineEnrichment,
+  getOnlineEnrichment,
+  previewAffiliations,
+  resumeOnlineEnrichment,
+  startOnlineEnrichment,
+} from "../../api/affiliations";
+import { ApiError } from "../../api/client";
+import Button, { buttonClass } from "../../components/ui/Button";
+import ConfirmModal from "../../components/common/ConfirmModal";
+import ModalPortal from "../../components/common/ModalPortal";
+import { useSingleFlight } from "../../components/common/useSingleFlight";
+import { useToast } from "../../contexts/ToastContext";
+import ManualReviewCard from "./ManualReviewCard";
+
+type Locale = "vi" | "en";
+
+const SOURCE_LABEL: Record<string, string> = { openalex: "OpenAlex", crossref: "Crossref" };
+const STATUS_LABEL: Record<string, Record<Locale, string>> = {
+  VERIFIED: { vi: "Đã xác minh định danh", en: "Identity verified" },
+  CORROBORATED: { vi: "Đã đối chiếu · Chưa xác minh", en: "Cross-checked · Not verified" },
+  UNRESOLVED: { vi: "Chưa xác định", en: "Unresolved" },
+};
+const OUTCOME_LABEL: Record<string, Record<Locale, string>> = {
+  inserted: { vi: "sẽ ghi mới", en: "to insert" },
+  reused: { vi: "đã có sẵn", en: "already stored" },
+  skipped: { vi: "bỏ qua", en: "skipped" },
+  conflicted: { vi: "xung đột (giữ lại)", en: "conflicted (withheld)" },
+};
+const BLOCKED_LABEL: Record<string, Record<Locale, string>> = {
+  SOURCE_DIR_NOT_CONFIGURED: {
+    vi: "Máy chủ chưa được cấu hình thư mục nguồn đơn vị (AFFILIATION_SOURCE_DIR).",
+    en: "The server has no affiliation source directory configured (AFFILIATION_SOURCE_DIR).",
+  },
+  SOURCE_DIR_NOT_FOUND: { vi: "Thư mục nguồn đã cấu hình không tồn tại.", en: "The configured source directory does not exist." },
+  BUNDLE_UNREADABLE: { vi: "Không đọc được bộ nguồn (tệp hỏng).", en: "The source bundle could not be read." },
+  NO_PUBLICATIONS: {
+    vi: "Chưa có công bố nào. Hãy nhập CSV Scopus và chuẩn hóa trước.",
+    en: "No publications yet. Import and normalize a Scopus CSV first.",
+  },
+  NOTHING_TO_APPLY: {
+    vi: "Không có gì mới để ghi: kết quả này đã được bạn áp dụng trước đó.",
+    en: "Nothing new to write: this result has already been applied.",
+  },
+  SOURCE_MISMATCH: {
+    vi: "Bộ nguồn mâu thuẫn với dữ liệu tính lại từ metadata gốc (có thể cũ hoặc bị sửa). Không được áp dụng.",
+    en: "The source bundle disagrees with the recomputation from raw metadata (stale or tampered). Cannot be applied.",
+  },
+};
+const ERROR_LABEL: Record<string, Record<Locale, string>> = {
+  PREVIEW_STALE: {
+    vi: "Dữ liệu hoặc nguồn đã thay đổi kể từ lần xem trước. Hãy xem trước lại.",
+    en: "Data or source changed since the preview. Preview again.",
+  },
+  AFFILIATION_APPLY_IN_PROGRESS: {
+    vi: "Một lượt áp dụng khác đang chạy. Thử lại sau.",
+    en: "Another apply run is in progress. Try again later.",
+  },
+  AFFILIATION_APPLY_FAILED: {
+    vi: "Áp dụng thất bại; không có dữ liệu nào được ghi.",
+    en: "Apply failed; nothing was written.",
+  },
+  ONLINE_CACHE_NOT_CONFIGURED: {
+    vi: "Máy chủ chưa cấu hình thư mục lưu kết quả thu thập trực tuyến.",
+    en: "The server has no online-enrichment cache directory configured.",
+  },
+  NO_PUBLICATIONS: {
+    vi: "Chưa có công bố nào. Hãy nhập CSV Scopus trước.",
+    en: "No publications yet. Import a Scopus CSV first.",
+  },
+  ENRICHMENT_ALREADY_RUNNING: {
+    vi: "Một lượt thu thập trực tuyến khác đang chạy.",
+    en: "Another online enrichment run is already in progress.",
+  },
+  ENRICHMENT_NOT_RESUMABLE: {
+    vi: "Lượt này không thể tiếp tục (có thể đã xử lý hết hoặc không có dữ liệu điểm dừng). Hãy bắt đầu một lượt mới.",
+    en: "This run cannot be resumed (all DOIs may already be processed, or no checkpoint data exists). Start a new run.",
+  },
+};
+const ENRICHMENT_STATUS_LABEL: Record<string, Record<Locale, string>> = {
+  RECEIVED: { vi: "Đã nhận, chuẩn bị chạy", en: "Received, about to start" },
+  RUNNING: { vi: "Đang thu thập…", en: "Collecting…" },
+  COMPLETED: { vi: "Hoàn tất", en: "Completed" },
+  FAILED: { vi: "Đã dừng", en: "Stopped" },
+  CANCELLED: { vi: "Đã tạm dừng", en: "Paused" },
+};
+const ENRICHMENT_FAILURE_CODE_LABEL: Record<string, Record<Locale, string>> = {
+  ENRICHMENT_INTERRUPTED: {
+    vi: 'Tiến trình bị gián đoạn khi máy chủ khởi động lại. Nhấn "Tiếp tục" để xử lý phần còn lại.',
+    en: 'The run was interrupted by a server restart. Click "Resume" to continue from where it left off.',
+  },
+  ENRICHMENT_PROCESSING_FAILED: {
+    vi: "Không thể hoàn tất thu thập dữ liệu trực tuyến. Hãy thử lại; nếu lỗi lặp lại, kiểm tra kết nối mạng của máy chủ.",
+    en: "Could not complete the online collection. Try again; if it keeps failing, check the server's network connection.",
+  },
+};
+const ENRICHMENT_ACTIVE: EnrichmentJob["status"][] = ["RECEIVED", "RUNNING"];
+
+const fmt = (n: number | null | undefined) => (n ?? 0).toLocaleString("vi-VN");
+const sourceOf = (key: string) => SOURCE_LABEL[key.split("/")[0]] ?? key.split("/")[0];
+const statusOf = (key: string, locale: Locale) => STATUS_LABEL[key.split("/")[1]]?.[locale] ?? key.split("/")[1];
+
+function Card({ title, children, testId }: { title: string; children: React.ReactNode; testId?: string }) {
+  return (
+    <section className="rounded-[5px] border border-slate-200/80 bg-white p-4 shadow-xs sm:p-5" data-testid={testId}>
+      <h2 className="mb-3 text-base font-bold text-slate-800">{title}</h2>
+      {children}
+    </section>
+  );
+}
+
+export default function AffiliationsTab({ locale }: { locale: Locale }) {
+  const vi = locale === "vi";
+  const toast = useToast();
+  const [overview, setOverview] = useState<AffiliationOverview | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<AffiliationPreview | null>(null);
+  const [previewing, setPreviewing] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [confirmed, setConfirmed] = useState(false);
+  const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
+  const [job, setJob] = useState<EnrichmentJob | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [resuming, setResuming] = useState(false);
+  const [confirmRerun, setConfirmRerun] = useState(false);
+  const [sourceMode, setSourceMode] = useState<"offline" | "online">("offline");
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setOverview(await getAffiliationOverview());
+      setLoadError(null);
+    } catch (error) {
+      setLoadError(error instanceof ApiError ? error.detail ?? error.message : vi ? "Không tải được dữ liệu." : "Could not load data.");
+    }
+  }, [vi]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  // On mount (first load, page reload, or switching back to this tab), ask
+  // the server which job — if any — is the most recent one and show its
+  // real state. This never starts a new job; it only looks up what already
+  // exists in the database, so a reload can never spawn a duplicate run.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const latest = await getLatestOnlineEnrichment();
+        if (!cancelled && latest) {
+          setJob(latest);
+          if (latest.status === "COMPLETED") setSourceMode("online");
+        }
+      } catch {
+        // No job yet, or a transient error — the "Start" button stays the
+        // default state; the ADMIN can still trigger a fresh run.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Poll the active online enrichment job every 2s, same pattern as the
+  // Scopus import history page: only while active, pause when the tab is hidden.
+  useEffect(() => {
+    if (!job || !ENRICHMENT_ACTIVE.includes(job.status)) {
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+      return;
+    }
+    const poll = async () => {
+      if (document.visibilityState !== "visible") return;
+      try {
+        const updated = await getOnlineEnrichment(job.id);
+        setJob(updated);
+        if (updated.status === "COMPLETED") {
+          setSourceMode("online");
+          setPreview(null);
+          setConfirmed(false);
+          toast.success(
+            vi ? "Thu thập trực tuyến hoàn tất" : "Online collection completed",
+            vi
+              ? `Đã xử lý ${updated.processed_dois}/${updated.total_dois} DOI.`
+              : `Processed ${updated.processed_dois}/${updated.total_dois} DOIs.`,
+          );
+        }
+      } catch {
+        // transient poll failure; try again on the next tick
+      }
+    };
+    pollRef.current = setInterval(poll, 2000);
+    window.addEventListener("focus", poll);
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+      window.removeEventListener("focus", poll);
+    };
+  }, [job, toast, vi]);
+
+  const explain = (error: unknown): string => {
+    if (error instanceof ApiError) {
+      return (error.code && ERROR_LABEL[error.code]?.[locale]) || error.detail || error.message;
+    }
+    return vi ? "Có lỗi không xác định." : "Unknown error.";
+  };
+
+  const runStartEnrichment = useSingleFlight(async () => {
+    setStarting(true);
+    setMessage(null);
+    try {
+      setJob(await startOnlineEnrichment());
+    } catch (error) {
+      setMessage({ kind: "error", text: explain(error) });
+      // Another tab/ADMIN may have started the already-running job this
+      // request collided with — sync the UI to the real job in the
+      // database instead of leaving a stale "no job" state on screen.
+      if (error instanceof ApiError && error.code === "ENRICHMENT_ALREADY_RUNNING") {
+        try {
+          const latest = await getLatestOnlineEnrichment();
+          if (latest) setJob(latest);
+        } catch {
+          // best-effort sync; the error message already explains the conflict
+        }
+      }
+    } finally {
+      setStarting(false);
+    }
+  });
+
+  const runCancelEnrichment = useSingleFlight(async () => {
+    if (!job) return;
+    try {
+      setJob(await cancelOnlineEnrichment(job.id));
+    } catch (error) {
+      setMessage({ kind: "error", text: explain(error) });
+    }
+  });
+
+  const runResumeEnrichment = useSingleFlight(async () => {
+    if (!job) return;
+    setResuming(true);
+    setMessage(null);
+    try {
+      setJob(await resumeOnlineEnrichment(job.id));
+    } catch (error) {
+      setMessage({ kind: "error", text: explain(error) });
+    } finally {
+      setResuming(false);
+    }
+  });
+
+  const runPreview = useSingleFlight(async () => {
+    setPreviewing(true);
+    setMessage(null);
+    setConfirmed(false);
+    try {
+      const jobId = sourceMode === "online" && job?.status === "COMPLETED" ? job.id : undefined;
+      setPreview(await previewAffiliations(jobId));
+    } catch (error) {
+      setPreview(null);
+      setMessage({ kind: "error", text: explain(error) });
+    } finally {
+      setPreviewing(false);
+    }
+  });
+
+  const runApply = useSingleFlight(async () => {
+    if (!preview || !preview.can_apply || !confirmed) return;
+    setApplying(true);
+    setMessage(null);
+    try {
+      const jobId = sourceMode === "online" && job?.status === "COMPLETED" ? job.id : undefined;
+      const done = await applyAffiliations(preview.fingerprint, jobId);
+      const inserted = done.result.resolutions_to_insert ?? 0;
+      const text = vi
+        ? `Đã áp dụng: ${fmt(inserted)} kết quả đối chiếu đơn vị được ghi.`
+        : `Applied: ${fmt(inserted)} affiliation resolutions written.`;
+      toast.success(vi ? "Áp dụng đơn vị hoàn tất" : "Affiliations applied", text);
+      setMessage({ kind: "ok", text });
+      setPreview(null);
+      setConfirmed(false);
+      await refresh();
+    } catch (error) {
+      const text = explain(error);
+      setMessage({ kind: "error", text });
+      if (error instanceof ApiError && error.code === "PREVIEW_STALE") setPreview(null);
+    } finally {
+      setApplying(false);
+    }
+  });
+
+  const source = overview?.source;
+  const db = overview?.database;
+
+  return (
+    <div className="space-y-4" data-testid="affiliations-tab">
+
+      {loadError && <p className="text-sm font-medium text-rose-600" role="alert">{loadError}</p>}
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Card title={vi ? "1. Nguồn dữ liệu đơn vị" : "1. Affiliation source"} testId="aff-source-card">
+          {!source ? (
+            <p className="text-sm text-slate-500">{vi ? "Đang tải dữ liệu..." : "Loading…"}</p>
+          ) : !source.configured ? (
+            <div className="space-y-1 text-sm" data-testid="aff-source-missing">
+              <p className="font-medium text-slate-700">
+                {vi
+                  ? "Chưa có dữ liệu đơn vị nào được nạp. Hãy chạy thu thập trực tuyến ở mục 3."
+                  : "No affiliation data has been loaded yet. Run online collection in section 3."}
+              </p>
+              {db && Object.keys(db.resolutions_by_source_and_status).length > 0 && (
+                <p className="text-emerald-700" data-testid="aff-source-missing-data-kept">
+                  {vi
+                    ? "Dữ liệu đã áp dụng trước đó vẫn được giữ nguyên (xem mục 2)."
+                    : "Data applied earlier is unchanged (see section 2)."}
+                </p>
+              )}
+              <div className="mt-2 flex flex-wrap items-center gap-1.5 text-slate-500" data-testid="aff-source-hint">
+                <span>{vi ? "Làm theo thứ tự:" : "Follow this order:"}</span>
+                <span className="rounded-[5px] border border-slate-200 bg-slate-50 px-1.5 py-0.5 font-semibold text-slate-700">
+                  {vi ? "3. Thu thập trực tuyến" : "3. Online collection"}
+                </span>
+                <span className="text-slate-400">→</span>
+                <span className="rounded-[5px] border border-slate-200 bg-slate-50 px-1.5 py-0.5 font-semibold text-slate-700">
+                  {vi ? "4. Xem trước và áp dụng" : "4. Preview and apply"}
+                </span>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-2 text-sm text-slate-700">
+              <p>
+                <span className="font-semibold">{vi ? "Thư mục: " : "Directory: "}</span>
+                <code className="rounded bg-slate-100 px-1">{source.directory_label}</code>{" "}
+                <span className={source.ready ? "font-bold text-emerald-700" : "font-bold text-rose-600"} data-testid="aff-source-state">
+                  {source.ready ? (vi ? "Sẵn sàng" : "Ready") : vi ? "Chưa sẵn sàng" : "Not ready"}
+                </span>
+              </p>
+              {source.problems.length > 0 && (
+                <p className="text-rose-600">
+                  {source.problems.map((p) => BLOCKED_LABEL[p]?.[locale] ?? p).join(" · ")}
+                </p>
+              )}
+              <ul className="space-y-0.5">
+                {source.files.map((f) => (
+                  <li key={f.name} className="flex flex-wrap items-center gap-1.5">
+                    <span className={f.present ? "text-emerald-600" : f.required ? "text-rose-600" : "text-slate-400"}>
+                      {f.present ? "✓" : f.required ? "✗" : "–"}
+                    </span>
+                    <code>{f.name}</code>
+                    {!f.required && <span className="text-slate-400">({vi ? "tùy chọn: đối chiếu chéo" : "optional: cross-check"})</span>}
+                    {f.sha256 && <span className="text-slate-400">SHA-256 {f.sha256.slice(0, 10)}…</span>}
+                  </li>
+                ))}
+              </ul>
+              {source.ready && (
+                <p className="text-slate-600" data-testid="aff-source-counts">
+                  {vi ? "Có " : "Contains "}
+                  <b>{fmt(source.openalex_works)}</b> {vi ? "bài trên OpenAlex" : "OpenAlex works"}, <b>{fmt(source.crossref_works)}</b>{" "}
+                  {vi ? "bài trên Crossref" : "Crossref works"}, <b>{fmt(source.orcid_records)}</b> ORCID (
+                  <b>{fmt(source.orcid_with_scopus_id)}</b> {vi ? "có khai Scopus ID" : "declare a Scopus ID"}).
+                  {source.retrieved_from && (
+                    <>
+                      {" "}
+                      {vi ? "Tải ngày " : "Retrieved "}
+                      {source.retrieved_from.slice(0, 10)}
+                      {source.retrieved_to && source.retrieved_to.slice(0, 10) !== source.retrieved_from.slice(0, 10)
+                        ? ` – ${source.retrieved_to.slice(0, 10)}`
+                        : ""}
+                      .
+                    </>
+                  )}
+                </p>
+              )}
+            </div>
+          )}
+        </Card>
+
+        <Card title={vi ? "2. Hiện trạng trong hệ thống" : "2. Current state"} testId="aff-state-card">
+          {!db ? (
+            <p className="text-sm text-slate-500">{vi ? "Đang tải dữ liệu..." : "Loading…"}</p>
+          ) : (
+            <div className="space-y-3 text-sm text-slate-700">
+              <p className="text-slate-500">
+                {vi
+                  ? "Số liệu tổng quan về công bố và đơn vị công tác đang có trong hệ thống."
+                  : "Overview of publications and affiliation data currently in the system."}
+              </p>
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                <div>
+                  <p className="text-lg font-bold text-slate-800">{fmt(db.publications)}</p>
+                  <p className="text-slate-500">{vi ? "Công bố" : "Publications"}</p>
+                </div>
+                <div>
+                  <p className="text-lg font-bold text-slate-800">{fmt(db.author_positions)}</p>
+                  <p className="text-slate-500">{vi ? "Vị trí tác giả" : "Author positions"}</p>
+                </div>
+                <div>
+                  <p className="text-lg font-bold text-slate-800">{fmt(db.organizations)}</p>
+                  <p className="text-slate-500">{vi ? "Tổ chức" : "Organizations"}</p>
+                </div>
+                <div>
+                  <p className="text-lg font-bold text-slate-800">{fmt(db.affiliation_entries)}</p>
+                  <p className="text-slate-500">{vi ? "Dòng đơn vị" : "Affiliation lines"}</p>
+                </div>
+              </div>
+              {Object.keys(db.resolutions_by_source_and_status).length === 0 ? null : (
+                <ul className="space-y-0.5" data-testid="aff-state-list">
+                  {Object.entries(db.resolutions_by_source_and_status)
+                    .sort()
+                    .map(([key, n]) => (
+                      <li key={key}>
+                        {sourceOf(key)} · {statusOf(key, locale)}: <b>{fmt(n)}</b>
+                      </li>
+                    ))}
+                </ul>
+              )}
+              {db.last_run && (
+                <p className="text-slate-500">
+                  {vi ? "Lần gần nhất: " : "Last run: "}
+                  {new Date(db.last_run.at).toLocaleString(vi ? "vi-VN" : "en-GB")}
+                  {db.last_run.action.endsWith("FAILED") ? (vi ? " (thất bại)" : " (failed)") : ""}
+                </p>
+              )}
+            </div>
+          )}
+        </Card>
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+      <Card title={vi ? "3. Thu thập đơn vị trực tuyến" : "3. Online affiliation collection (optional)"} testId="aff-online-card">
+        <p className="mb-3 text-sm leading-relaxed text-slate-600">
+          {vi
+            ? "Tại đây có thể chủ động tra cứu OpenAlex, Crossref và ORCID công khai cho DOI của các công bố hiện có, thay vì cần chuẩn bị bộ nguồn offline thủ công. Chạy nền; có thể tạm dừng và tiếp tục bất cứ lúc nào."
+            : "ADMIN may actively query public OpenAlex, Crossref and ORCID for the DOIs of existing publications, instead of preparing an offline bundle by hand. Runs in the background; can be paused and resumed at any time."}
+        </p>
+        <ConfirmModal
+          open={confirmRerun}
+          variant="warning"
+          title={vi ? "Đã thu thập trực tuyến trước đó" : "Online collection already done"}
+          description={
+            job ? (
+              <>
+                <p>
+                  {vi
+                    ? `Lượt gần nhất đã hoàn tất lúc ${new Date(job.updated_at).toLocaleString("vi-VN")}: ${fmt(job.processed_dois)}/${fmt(job.total_dois)} DOI (OpenAlex tìm thấy ${fmt(job.openalex_found)}, Crossref ${fmt(job.crossref_found)}, ORCID ${fmt(job.orcid_fetched)}).`
+                    : `The latest run finished at ${new Date(job.updated_at).toLocaleString("en-GB")}: ${fmt(job.processed_dois)}/${fmt(job.total_dois)} DOIs (OpenAlex found ${fmt(job.openalex_found)}, Crossref ${fmt(job.crossref_found)}, ORCID ${fmt(job.orcid_fetched)}).`}
+                </p>
+                <p>
+                  {vi
+                    ? "Chạy lại sẽ gọi lại các dịch vụ bên ngoài và mất nhiều thời gian. Bạn có muốn chạy lại không?"
+                    : "Running again will call the external services again and takes a long time. Do you want to run it again?"}
+                </p>
+              </>
+            ) : null
+          }
+          confirmLabel={vi ? "Chạy lại" : "Run again"}
+          cancelLabel={vi ? "Không, giữ kết quả" : "No, keep results"}
+          onCancel={() => setConfirmRerun(false)}
+          onConfirm={() => {
+            setConfirmRerun(false);
+            void runStartEnrichment();
+          }}
+        />
+        {!job || !ENRICHMENT_ACTIVE.includes(job.status) ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={() => {
+                // A finished run already holds results: ask before repeating the slow external lookups.
+                if (job?.status === "COMPLETED") setConfirmRerun(true);
+                else void runStartEnrichment();
+              }}
+              disabled={starting || resuming}
+              data-testid="aff-online-start-btn"
+            >
+              {starting ? (vi ? "Đang khởi tạo…" : "Starting…") : vi ? "Bắt đầu thu thập trực tuyến" : "Start online collection"}
+            </Button>
+            {job?.resumable && (
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={runResumeEnrichment}
+                disabled={resuming || starting}
+                data-testid="aff-online-resume-btn"
+              >
+                {resuming
+                  ? (vi ? "Đang khởi động…" : "Starting…")
+                  : vi
+                    ? `Tiếp tục · còn ${fmt(job.total_dois - job.processed_dois)} DOI`
+                    : `Resume · ${fmt(job.total_dois - job.processed_dois)} DOIs left`}
+              </Button>
+            )}
+          </div>
+        ) : (
+          <div className="flex items-center gap-3" data-testid="aff-online-running">
+            <Button type="button" variant="secondary" onClick={runCancelEnrichment} data-testid="aff-online-cancel-btn">
+              {vi ? "Tạm dừng" : "Pause"}
+            </Button>
+            <span className="text-sm font-medium text-sky-700">
+              {job.processed_dois >= job.total_dois
+                ? (vi ? "Đang hoàn tất…" : "Finishing…")
+                : `${ENRICHMENT_STATUS_LABEL[job.status]?.[locale] ?? job.status} (${fmt(job.processed_dois)}/${fmt(job.total_dois)} DOI)`}
+            </span>
+          </div>
+        )}
+        {job && !ENRICHMENT_ACTIVE.includes(job.status) && (
+          <div className="mt-3 text-sm text-slate-700" data-testid="aff-online-result">
+            <p>
+              <span className={job.status === "COMPLETED" ? "font-bold text-emerald-700" : "font-bold text-rose-600"}>
+                {ENRICHMENT_STATUS_LABEL[job.status]?.[locale] ?? job.status}
+              </span>
+              {job.status === "COMPLETED" && (
+                <>
+                  {" · "}
+                  {fmt(job.openalex_found)} {vi ? "bài OpenAlex" : "OpenAlex works"}
+                  {" · "}
+                  {fmt(job.crossref_found)} {vi ? "bài Crossref" : "Crossref works"}
+                  {" · "}
+                  {fmt(job.orcid_fetched)} ORCID
+                </>
+              )}
+            </p>
+            {job.status === "FAILED" && job.error_summary?.code && (
+              <p className="mt-1 rounded-[5px] border border-rose-200 bg-rose-50 p-2 text-rose-800" data-testid="aff-online-failure-reason">
+                {ENRICHMENT_FAILURE_CODE_LABEL[job.error_summary.code]?.[locale] ?? job.error_summary.message}
+              </p>
+            )}
+            {(job.status === "FAILED" || job.status === "CANCELLED") && (
+              <p className="mt-1 text-slate-500" data-testid="aff-online-progress-hint">
+                {job.processed_dois > 0
+                  ? vi
+                    ? `Đã xử lý ${fmt(job.processed_dois)}/${fmt(job.total_dois)} DOI.`
+                    : `Processed ${fmt(job.processed_dois)}/${fmt(job.total_dois)} DOIs.`
+                  : vi
+                    ? "Chưa xử lý DOI nào."
+                    : "No DOIs were processed."}
+                {job.resumable && (
+                  <span className="ml-1 font-medium text-sky-700">
+                    {vi ? ` Nhấn "Tiếp tục" để xử lý phần còn lại.` : ' Click "Resume" to process the rest.'}
+                  </span>
+                )}
+                {!job.resumable && (
+                  <span className="ml-1">
+                    {vi ? ` Nhấn "Bắt đầu" để chạy lại từ đầu.` : ' Click "Start" to run again from the beginning.'}
+                  </span>
+                )}
+              </p>
+            )}
+            {job.status === "COMPLETED" && (
+              <p className="mt-1 text-slate-500">
+                {vi
+                  ? 'Kết quả đã hoàn thành. Nhấn "Xem trước" để dùng kết quả này nhé!'
+                  : 'Result is ready. Click "Preview" below to use this result instead of the offline bundle.'}
+              </p>
+            )}
+          </div>
+        )}
+      </Card>
+
+      <Card title={vi ? "4. Xem trước và áp dụng" : "4. Preview and apply"} testId="aff-preview-card">
+        <p className="mb-3 text-sm leading-relaxed text-slate-600">
+          {vi
+            ? "Bước cuối gồm 2 lượt bấm: \"Xem trước\" chỉ tính thử, không ghi gì vào hệ thống — cho biết đơn vị công tác nào sẽ được gán cho tác giả nào. Xem kỹ kết quả rồi mới nhấn \"Xác nhận áp dụng\" để lưu chính thức."
+            : "Two clicks: \"Preview\" only computes the result, writing nothing yet — it shows which affiliation would be assigned to which author. Review it, then click \"Confirm and apply\" to save for real."}
+        </p>
+        <div className="mb-3 space-y-1.5">
+          <Button type="button" variant="secondary" onClick={runPreview} disabled={previewing || applying} loading={previewing} data-testid="aff-preview-btn">
+            {previewing ? (vi ? "Đang tính…" : "Computing…") : vi ? "Xem trước" : "Preview"}
+          </Button>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <span className="text-sm text-slate-500" data-testid="aff-preview-source-mode">
+              {sourceMode === "online" && job?.status === "COMPLETED"
+                ? vi
+                  ? "Dùng kết quả thu thập trực tuyến vừa chạy."
+                  : "Using the result of the online run just completed."
+                : vi
+                  ? "Xem trước chỉ đọc, không ghi dữ liệu."
+                  : "Preview is read-only and writes nothing."}
+            </span>
+            {job?.status === "COMPLETED" && source?.ready && (
+              <button
+                type="button"
+                className="text-sm font-medium text-sky-700 underline"
+                onClick={() => setSourceMode((m) => (m === "online" ? "offline" : "online"))}
+                data-testid="aff-source-mode-toggle"
+              >
+                {sourceMode === "online"
+                  ? vi
+                    ? "Chuyển sang bộ nguồn offline"
+                    : "Switch to offline bundle"
+                  : vi
+                    ? "Chuyển sang kết quả trực tuyến"
+                    : "Switch to online result"}
+              </button>
+            )}
+          </div>
+        </div>
+
+        {message && !preview && (
+          <p className={`mb-3 text-sm font-medium ${message.kind === "ok" ? "text-emerald-700" : "text-rose-600"}`} role="status" data-testid="aff-message">
+            {message.text}
+          </p>
+        )}
+      </Card>
+      </div>
+
+      {preview && (
+        <ModalPortal>
+          <div
+            className="fixed inset-x-0 top-16 bottom-0 md:left-[var(--app-sidebar-w)] z-50 flex items-center justify-center overflow-y-auto bg-black/60 p-4 modal-backdrop-in transition-[left] duration-200 ease-out"
+            onClick={() => { setPreview(null); setConfirmed(false); }}
+          >
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="aff-preview-modal-title"
+              className="flex h-full w-full flex-col overflow-hidden rounded-card border border-blue-200 bg-white shadow-2xl modal-panel-in"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex shrink-0 items-start justify-between gap-4 border-b border-blue-100 bg-blue-50 px-5 py-4">
+                <div className="min-w-0">
+                  <h2 id="aff-preview-modal-title" className="text-sm sm:text-base font-bold text-[#2f4ea6]">
+                    {vi ? "Xem trước & áp dụng đối chiếu đơn vị" : "Preview & apply affiliation reconciliation"}
+                  </h2>
+                  <p className="mt-0.5 text-sm text-[#3A5FC3]">
+                    {vi ? "Chỉ ghi vào hệ thống sau khi bạn xác nhận bên dưới." : "Nothing is written until you confirm below."}
+                  </p>
+                </div>
+              </div>
+
+              <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+          <div className="space-y-4 text-sm text-slate-700" data-testid="aff-preview">
+            {message && (
+              <p className={`text-sm font-medium ${message.kind === "ok" ? "text-emerald-700" : "text-rose-600"}`} role="status" data-testid="aff-message">
+                {message.text}
+              </p>
+            )}
+            {preview.blocked_reason && (
+              <p className="rounded-[5px] border border-amber-200 bg-amber-50 p-2 font-medium text-amber-800" data-testid="aff-blocked">
+                {BLOCKED_LABEL[preview.blocked_reason]?.[locale] ?? preview.blocked_reason}
+              </p>
+            )}
+            {preview.input.papers !== undefined && (
+              <section className="rounded-[5px] border border-slate-200/80 bg-white p-5 shadow-xs" data-testid="aff-coverage">
+                <div className="flex items-center justify-between pb-3 mb-3 border-b border-slate-100">
+                  <h3 className="text-sm font-bold uppercase tracking-wider text-slate-800">
+                    {vi ? "Mức bao phủ của nguồn" : "Source coverage"}
+                  </h3>
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-center sm:grid-cols-4 lg:grid-cols-7">
+                  <div className="rounded-[5px] border border-slate-200/80 bg-white p-2.5 shadow-2xs">
+                    <span className="text-sm font-medium text-slate-500 uppercase">{vi ? "Công bố cần đối chiếu" : "Publications"}</span>
+                    <p className="mt-0.5 text-base font-black text-slate-800">{fmt(preview.input.papers)}</p>
+                  </div>
+                  <div className="rounded-[5px] border border-slate-200/80 bg-white p-2.5 shadow-2xs">
+                    <span className="text-sm font-medium text-slate-500 uppercase">{vi ? "Vị trí tác giả" : "Author positions"}</span>
+                    <p className="mt-0.5 text-base font-black text-slate-800">{fmt(preview.input.author_slots)}</p>
+                  </div>
+                  <div className="rounded-[5px] border border-slate-200/80 bg-white p-2.5 shadow-2xs">
+                    <span className="text-sm font-medium text-slate-500 uppercase">{vi ? "Có bài trong OpenAlex" : "Found in OpenAlex"}</span>
+                    <p className="mt-0.5 text-base font-black text-emerald-700">{fmt(preview.input.papers_with_openalex_work)}</p>
+                  </div>
+                  <div className="rounded-[5px] border border-slate-200/80 bg-white p-2.5 shadow-2xs">
+                    <span className="text-sm font-medium text-slate-500 uppercase">{vi ? "Có bài trong Crossref" : "Found in Crossref"}</span>
+                    <p className="mt-0.5 text-base font-black text-emerald-700">{fmt(preview.input.papers_with_crossref_work)}</p>
+                  </div>
+                  <div className="rounded-[5px] border border-slate-200/80 bg-white p-2.5 shadow-2xs">
+                    <span className="text-sm font-medium text-slate-500 uppercase">{vi ? "Không có bài ở nguồn nào" : "In no source"}</span>
+                    <p className="mt-0.5 text-base font-black text-amber-700">{fmt(preview.input.papers_without_any_work)}</p>
+                  </div>
+                  <div className="rounded-[5px] border border-slate-200/80 bg-white p-2.5 shadow-2xs">
+                    <span className="text-sm font-medium text-slate-500 uppercase">{vi ? "Không có DOI" : "Without DOI"}</span>
+                    <p className="mt-0.5 text-base font-black text-amber-700">{fmt(preview.input.papers_without_doi)}</p>
+                  </div>
+                  <div className="rounded-[5px] border border-slate-200/80 bg-white p-2.5 shadow-2xs">
+                    <span className="text-sm font-medium text-slate-500 uppercase">{vi ? "DOI trùng (không dùng)" : "Duplicate DOI"}</span>
+                    <p className="mt-0.5 text-base font-black text-slate-800">{fmt(preview.input.papers_with_duplicate_doi)}</p>
+                  </div>
+                </div>
+                <dl className="mt-3 space-y-1 border-t border-slate-100 pt-3 text-sm" data-testid="aff-cross-check">
+                  <div className="flex flex-wrap items-baseline gap-x-1.5">
+                    <dt className="font-semibold text-slate-600">{vi ? "Đối chiếu chéo với tệp khảo sát:" : "Cross-check with survey file:"}</dt>
+                    <dd>
+                      {preview.input.cross_check_against_survey_jsonl ? (
+                        <>
+                          <b>{fmt(preview.input.cross_check_links_matched)}</b> {vi ? "khớp" : "agree"}
+                          {(preview.input.cross_check_links_not_covered ?? 0) > 0 && (
+                            <>
+                              , <b>{fmt(preview.input.cross_check_links_not_covered)}</b> {vi ? "không có trong tệp (chỉ tính lại từ metadata gốc)" : "not in the file (recomputed from raw metadata only)"}
+                            </>
+                          )}
+                          {preview.source_mismatches > 0 && <b className="text-rose-600"> · {fmt(preview.source_mismatches)} {vi ? "lệch" : "mismatches"}</b>}
+                        </>
+                      ) : (
+                        <b>{vi ? "Không có tệp" : "No file"}</b>
+                      )}
+                    </dd>
+                  </div>
+                </dl>
+              </section>
+            )}
+
+            {preview.report.by_source_and_confidence && (
+              <section className="rounded-[5px] border border-slate-200/80 bg-white p-5 shadow-xs">
+                <div className="flex items-center justify-between pb-3 mb-3 border-b border-slate-100">
+                  <h3 className="text-sm font-bold uppercase tracking-wider text-slate-800">
+                    {vi ? "Kết quả theo nguồn và mức tin cậy" : "Result by source and confidence"}
+                  </h3>
+                </div>
+                <div className="overflow-hidden rounded-[5px] border border-slate-200/80">
+                  <div className="overflow-x-auto">
+                    <table className="w-full min-w-[32rem] text-left text-sm" data-testid="aff-preview-table">
+                      <thead className="border-b border-slate-200/80 bg-slate-50/70 text-slate-600">
+                        <tr>
+                          <th className="px-2.5 py-3.5 font-bold whitespace-nowrap">{vi ? "Nguồn" : "Source"}</th>
+                          <th className="px-2.5 py-3.5 font-bold whitespace-nowrap">{vi ? "Mức" : "Level"}</th>
+                          {Object.keys(OUTCOME_LABEL).map((k) => (
+                            <th key={k} className="px-2.5 py-3.5 text-right font-bold whitespace-nowrap">{OUTCOME_LABEL[k][locale]}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {Object.entries(preview.report.by_source_and_confidence)
+                          .sort()
+                          .map(([key, counts]) => (
+                            <tr key={key} className="hover:bg-slate-50/50 transition-colors">
+                              <td className="px-2.5 py-3.5 font-medium text-slate-700">{sourceOf(key)}</td>
+                              <td className="px-2.5 py-3.5 font-medium text-slate-700">{statusOf(key, locale)}</td>
+                              {Object.keys(OUTCOME_LABEL).map((k) => (
+                                <td key={k} className="px-2.5 py-3.5 text-right font-bold text-slate-800 tabular-nums">{fmt((counts as Record<string, number>)[k])}</td>
+                              ))}
+                            </tr>
+                          ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+                <p className="mt-3 text-sm" data-testid="aff-preview-totals">
+                  {vi ? "Sẽ ghi: " : "Will write: "}
+                  <b>{fmt(preview.report.resolutions_to_insert)}</b> {vi ? "kết quả đối chiếu" : "resolutions"},{" "}
+                  <b>{fmt(preview.report.affiliations_to_insert)}</b> {vi ? "dòng đơn vị" : "affiliation lines"},{" "}
+                  <b>{fmt(preview.report.organizations_to_insert)}</b> {vi ? "tổ chức mới" : "new organizations"}.
+                </p>
+                {preview.report.conflict_reasons && Object.keys(preview.report.conflict_reasons).length > 0 && (
+                  <p className="mt-1 text-sm text-slate-500">
+                    {vi ? "Xung đột được giữ lại an toàn: " : "Conflicts safely withheld: "}
+                    {Object.entries(preview.report.conflict_reasons).map(([k, n]) => `${k} (${fmt(n)})`).join(" · ")}
+                  </p>
+                )}
+              </section>
+            )}
+
+            <label className="flex items-start gap-2 rounded-[5px] border border-slate-200 bg-slate-50 p-2.5">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={confirmed}
+                disabled={!preview.can_apply || applying}
+                onChange={(e) => setConfirmed(e.target.checked)}
+                data-testid="aff-confirm"
+              />
+              <span>
+                {vi
+                  ? `Tôi đã xem kết quả trên. Đơn vị đến từ nguồn ngoài, "Đã đối chiếu" chưa phải "Đã xác minh", và tác giả không đủ bằng chứng sẽ giữ "Chưa xác định".`
+                  : `I reviewed the result above. Units come from external sources, "Cross-checked" is not "Verified", and authors without enough evidence stay "Unresolved".`}
+              </span>
+            </label>
+          </div>
+              </div>
+
+              <div className="flex shrink-0 flex-wrap justify-end gap-2 border-t border-slate-100 px-5 py-3">
+                <Button
+                  type="button"
+                  variant="primary"
+                  onClick={runApply}
+                  disabled={!preview.can_apply || !confirmed || applying}
+                  loading={applying}
+                  data-testid="aff-apply-btn"
+                >
+                  {applying ? (vi ? "Đang áp dụng…" : "Applying…") : vi ? "Xác nhận áp dụng" : "Confirm and apply"}
+                </Button>
+                <button
+                  type="button"
+                  onClick={() => { setPreview(null); setConfirmed(false); }}
+                  className={buttonClass("secondary")}
+                >
+                  {vi ? "Đóng" : "Close"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </ModalPortal>
+      )}
+
+      <ManualReviewCard locale={locale} />
+    </div>
+  );
+}

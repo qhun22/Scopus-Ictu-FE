@@ -1,0 +1,357 @@
+/** ADMIN workflow: author-affiliation source status -> preview -> apply. */
+
+import { apiDownload, apiGet, apiPost, apiPut, ApiRequestOptions } from "./client";
+
+export interface AffiliationBundleFile {
+  name: string;
+  required: boolean;
+  present: boolean;
+  size_bytes: number | null;
+  sha256: string | null;
+}
+
+export interface AffiliationBundleStatus {
+  configured: boolean;
+  ready: boolean;
+  directory_label: string | null;
+  files: AffiliationBundleFile[];
+  problems: string[];
+  openalex_works: number | null;
+  crossref_works: number | null;
+  orcid_records: number | null;
+  orcid_with_scopus_id: number | null;
+  retrieved_from: string | null;
+  retrieved_to: string | null;
+  cross_check_available: boolean;
+}
+
+export interface AffiliationDatabaseSummary {
+  publications: number;
+  author_positions: number;
+  organizations: number;
+  resolutions_by_source_and_status: Record<string, number>;
+  affiliation_entries: number;
+  last_run: { action: string; at: string; fingerprint: string | null } | null;
+}
+
+export interface AffiliationOverview {
+  source: AffiliationBundleStatus;
+  database: AffiliationDatabaseSummary;
+}
+
+export type OutcomeCounts = Partial<Record<"inserted" | "reused" | "skipped" | "conflicted", number>>;
+
+export interface AffiliationReport {
+  by_source_and_confidence: Record<string, OutcomeCounts>;
+  conflict_reasons: Record<string, number>;
+  skipped_reasons: Record<string, number>;
+  resolutions_to_insert: number;
+  affiliations_to_insert: number;
+  organizations_to_insert: number;
+  organizations_reused: number;
+  organization_attribute_drift: number;
+}
+
+export interface AffiliationInputStats {
+  papers: number;
+  author_slots: number;
+  inputs: number;
+  papers_without_doi: number;
+  papers_with_duplicate_doi: number;
+  papers_with_openalex_work: number;
+  papers_with_crossref_work: number;
+  papers_with_any_work: number;
+  papers_without_any_work: number;
+  cross_check_against_survey_jsonl: boolean;
+  cross_check_links_matched: number;
+  cross_check_links_not_covered: number;
+}
+
+export interface AffiliationPreview {
+  fingerprint: string;
+  can_apply: boolean;
+  blocked_reason: string | null;
+  publications: number;
+  source: AffiliationBundleStatus;
+  input: Partial<AffiliationInputStats>;
+  report: Partial<AffiliationReport>;
+  source_mismatches: number;
+  resolutions_to_insert: number;
+}
+
+export interface AffiliationApplyResult {
+  run_id: string;
+  fingerprint: string;
+  result: Partial<AffiliationReport>;
+}
+
+export type EnrichmentJobStatus = "RECEIVED" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED";
+
+export interface EnrichmentJob {
+  id: string;
+  status: EnrichmentJobStatus;
+  total_dois: number;
+  processed_dois: number;
+  openalex_found: number;
+  crossref_found: number;
+  orcid_fetched: number;
+  bundle_dir: string | null;
+  error_summary: { code?: string; message?: string } | null;
+  resumed_from_job_id: string | null;
+  resumable: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export function getAffiliationOverview(options: ApiRequestOptions = {}): Promise<AffiliationOverview> {
+  return apiGet<AffiliationOverview>("/api/v1/affiliations/overview", options);
+}
+
+export function previewAffiliations(
+  jobId?: string,
+  options: ApiRequestOptions = {},
+): Promise<AffiliationPreview> {
+  const path = jobId
+    ? `/api/v1/affiliations/preview?job_id=${encodeURIComponent(jobId)}`
+    : "/api/v1/affiliations/preview";
+  return apiPost<AffiliationPreview, Record<string, never>>(path, {}, options);
+}
+
+export function applyAffiliations(
+  fingerprint: string,
+  jobId?: string,
+  options: ApiRequestOptions = {},
+): Promise<AffiliationApplyResult> {
+  return apiPost<AffiliationApplyResult, { fingerprint: string; confirm: boolean; job_id?: string }>(
+    "/api/v1/affiliations/apply",
+    jobId ? { fingerprint, confirm: true, job_id: jobId } : { fingerprint, confirm: true },
+    options,
+  );
+}
+
+export function startOnlineEnrichment(options: ApiRequestOptions = {}): Promise<EnrichmentJob> {
+  return apiPost<EnrichmentJob, Record<string, never>>("/api/v1/affiliations/enrichment/online", {}, options);
+}
+
+export function getOnlineEnrichment(jobId: string, options: ApiRequestOptions = {}): Promise<EnrichmentJob> {
+  return apiGet<EnrichmentJob>(`/api/v1/affiliations/enrichment/online/${jobId}`, options);
+}
+
+/** Most recently created job, regardless of status — null if none exists yet.
+ * Used to find and display the right job after a reload/tab switch without
+ * remembering its id client-side, and without starting a new one. */
+export function getLatestOnlineEnrichment(options: ApiRequestOptions = {}): Promise<EnrichmentJob | null> {
+  return apiGet<EnrichmentJob | null>("/api/v1/affiliations/enrichment/online/latest", options);
+}
+
+export function cancelOnlineEnrichment(jobId: string, options: ApiRequestOptions = {}): Promise<EnrichmentJob> {
+  return apiPost<EnrichmentJob, Record<string, never>>(
+    `/api/v1/affiliations/enrichment/online/${jobId}/cancel`,
+    {},
+    options,
+  );
+}
+
+export function resumeOnlineEnrichment(jobId: string, options: ApiRequestOptions = {}): Promise<EnrichmentJob> {
+  return apiPost<EnrichmentJob, Record<string, never>>(
+    `/api/v1/affiliations/enrichment/online/${jobId}/resume`,
+    {},
+    options,
+  );
+}
+
+// --------------------------------------------------------------------------- manual review (Priority 2 / NO-JSON closure)
+export interface NeedsReviewItem {
+  publication_author_id: string;
+  eid: string;
+  title: string;
+  author_order: number;
+  scopus_id: string;
+  preferred_name: string;
+  /** needs-review: UNRESOLVED | CONFLICTING_SOURCES | LOW_CONFIDENCE; gap list: a gap reason code. */
+  reason_kind: string;
+  resolution_summaries: Array<{
+    source_system: string;
+    link_status: string;
+    unresolved_reason: string | null;
+    raw_affiliations?: string[];
+  }>;
+  has_override: boolean;
+  doi?: string | null;
+  /** ALL overrides for this position — active and revoked, newest first. */
+  overrides: OverrideFull[];
+}
+
+export interface NeedsReviewListResponse {
+  items: NeedsReviewItem[];
+  total: number;
+}
+
+export interface OverrideFull {
+  id: string;
+  publication_author_id: string;
+  affiliation_text: string;
+  confidence: "CORROBORATED" | "UNRESOLVED";
+  status: "ACTIVE" | "REVOKED";
+  evidence_url: string;
+  reason: string;
+  created_by_user_id: string;
+  updated_by_user_id: string;
+  revoked_by_user_id: string | null;
+  revoked_at: string | null;
+  version: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AddOverrideBody {
+  publication_author_id: string;
+  affiliation_text: string;
+  confidence: "CORROBORATED" | "UNRESOLVED";
+  evidence_url: string;
+  reason: string;
+}
+
+export interface UpdateOverrideBody {
+  affiliation_text: string;
+  confidence: "CORROBORATED" | "UNRESOLVED";
+  evidence_url: string;
+  reason: string;
+  expected_version: number;
+}
+
+export interface RevokeOverrideBody {
+  reason: string;
+  expected_version: number;
+}
+
+export function getNeedsReview(
+  params: { limit?: number; offset?: number; query?: string; reason_kind?: string; ictu_only?: boolean } = {},
+  options: ApiRequestOptions = {},
+): Promise<NeedsReviewListResponse> {
+  const query = new URLSearchParams();
+  if (params.limit != null) query.set("limit", String(params.limit));
+  if (params.offset != null) query.set("offset", String(params.offset));
+  if (params.query) {
+    query.set("query", params.query);
+    query.set("q", params.query);
+  }
+  if (params.reason_kind) query.set("reason_kind", params.reason_kind);
+  if (params.ictu_only) query.set("ictu_only", "true");
+  const qs = query.toString();
+  return apiGet<NeedsReviewListResponse>(`/api/v1/affiliations/needs-review${qs ? `?${qs}` : ""}`, options);
+}
+
+export interface BulkAddOverridesBody {
+  items: Array<{ publication_author_id: string; evidence_url: string }>;
+  affiliation_text: string;
+  confidence: "CORROBORATED" | "UNRESOLVED";
+  reason: string;
+}
+
+/** Add the same unit to several positions of ONE Scopus author, all or none. */
+export function addOverridesBulk(body: BulkAddOverridesBody, options: ApiRequestOptions = {}): Promise<OverrideFull[]> {
+  return apiPost<OverrideFull[], BulkAddOverridesBody>("/api/v1/affiliations/overrides/bulk", body, options);
+}
+
+/** Add a new active unit statement for a position. Does not touch any other override already on it. */
+export function addOverride(body: AddOverrideBody, options: ApiRequestOptions = {}): Promise<OverrideFull> {
+  return apiPost<OverrideFull, AddOverrideBody>("/api/v1/affiliations/overrides", body, options);
+}
+
+/** Edit exactly one override by its own id. */
+export function updateOverride(
+  overrideId: string,
+  body: UpdateOverrideBody,
+  options: ApiRequestOptions = {},
+): Promise<OverrideFull> {
+  return apiPut<OverrideFull, UpdateOverrideBody>(`/api/v1/affiliations/overrides/${overrideId}`, body, options);
+}
+
+/** Revoke one override (kept, not deleted, for audit); other overrides on the position are unaffected. */
+export function revokeOverride(
+  overrideId: string,
+  body: RevokeOverrideBody,
+  options: ApiRequestOptions = {},
+): Promise<OverrideFull> {
+  return apiPost<OverrideFull, RevokeOverrideBody>(
+    `/api/v1/affiliations/overrides/${overrideId}/revoke`,
+    body,
+    options,
+  );
+}
+
+// --------------------------------------------------------------------------- positions with no unit (week 7)
+export interface AffiliationGapItem {
+  publication_author_id: string;
+  eid: string;
+  doi: string | null;
+  title: string;
+  year: number | null;
+  author_count: number;
+  author_order: number;
+  scopus_id: string;
+  author_name: string;
+  affiliation_status: string;
+  /** One of the 16 gap reason codes. */
+  reason: string;
+  by_source: Array<{ source: string; link_status: string; reason: string | null }>;
+  admin_reviewed: boolean;
+  ictu_lecturer: string | null;
+  /** Every override of the position, ACTIVE and REVOKED, newest first. */
+  overrides: OverrideFull[];
+}
+
+export interface AffiliationGapSummary {
+  total_positions: number;
+  total_gaps: number;
+  publications_with_gaps: number;
+  by_reason: Record<string, number>;
+}
+
+export interface AffiliationGapListResponse {
+  items: AffiliationGapItem[];
+  total: number;
+  page: number;
+  page_size: number;
+  summary: AffiliationGapSummary;
+}
+
+export interface AffiliationGapQuery {
+  page?: number;
+  page_size?: number;
+  year?: number;
+  eid?: string;
+  reason?: string;
+  /** Only positions with an APPROVED ICTU lecturer link (not pending proposals). */
+  ictu_only?: boolean;
+}
+
+function gapQuery(params: AffiliationGapQuery): string {
+  const query = new URLSearchParams();
+  if (params.page != null) query.set("page", String(params.page));
+  if (params.page_size != null) query.set("page_size", String(params.page_size));
+  if (params.year != null) query.set("year", String(params.year));
+  if (params.eid) query.set("eid", params.eid);
+  if (params.reason) query.set("reason", params.reason);
+  if (params.ictu_only) query.set("ictu_only", "true");
+  const qs = query.toString();
+  return qs ? `?${qs}` : "";
+}
+
+/** ADMIN: author positions with no affiliation to show, one reason each. */
+export function getAffiliationGaps(
+  params: AffiliationGapQuery = {},
+  options: ApiRequestOptions = {},
+): Promise<AffiliationGapListResponse> {
+  return apiGet<AffiliationGapListResponse>(`/api/v1/publications/affiliation-gaps${gapQuery(params)}`, options);
+}
+
+/** ADMIN: the same list as a CSV Excel can open (no paging; page and page_size are ignored). */
+export function exportAffiliationGapsCsv(
+  params: AffiliationGapQuery = {},
+  options: ApiRequestOptions = {},
+): Promise<{ blob: Blob; filename: string }> {
+  const { page: _page, page_size: _pageSize, ...filters } = params;
+  return apiDownload(`/api/v1/publications/affiliation-gaps/export${gapQuery(filters)}`, options);
+}
