@@ -3,7 +3,7 @@
 Giao diện web (React + TypeScript + Vite + Tailwind + Ant Design) của hệ thống quản lý và chuẩn hóa hồ sơ tác giả,
 công bố khoa học Scopus cho ICTU. API ở repo [Scopus-Ictu-BE](https://github.com/qhun22/Scopus-Ictu-BE).
 
-> Repo này được đồng bộ từ repo chính [Scopus-Ictu](https://github.com/qhun22/Scopus-Ictu) (commit `753547d`). Mọi thay đổi mã nguồn làm ở repo chính.
+> Repo này được đồng bộ từ repo chính [Scopus-Ictu](https://github.com/qhun22/Scopus-Ictu) (commit `3d6c62a`). Mọi thay đổi mã nguồn làm ở repo chính.
 
 ## Chạy
 
